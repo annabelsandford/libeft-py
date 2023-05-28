@@ -35,4 +35,4 @@ Ensure that the PIL (Pillow) package is successfully installed and imported in t
 
 ## License
 
-This project is licensed under the MIT License.
+This project is licensed under the BSD 3-Clause.
