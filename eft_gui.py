@@ -1,0 +1,329 @@
+import importlib.util
+import subprocess
+import urllib.request
+import time
+import os
+import tkinter as tk
+from tkinter import filedialog
+from tkinter import ttk
+from PIL import Image
+import struct
+from concurrent.futures import ProcessPoolExecutor
+from concurrent.futures import ThreadPoolExecutor
+
+# Check if PIL is installed
+spec = importlib.util.find_spec("PIL")
+if spec is None:
+    # PIL is not installed, download and install it
+    print("PIL is not installed. Downloading and installing...")
+    urllib.request.urlretrieve("https://bootstrap.pypa.io/pip/2.7/get-pip.py", "get-pip.py")
+    urllib.request.urlretrieve("https://raw.githubusercontent.com/python-pillow/Pillow/master/requirements.txt", "requirements.txt")
+    
+    # Install pip
+    subprocess.run(["python", "get-pip.py"])
+    
+    # Install Pillow requirements
+    subprocess.run(["pip", "install", "-r", "requirements.txt"])
+    print("PIL installation complete.")
+
+# EFT magic number
+EFT_MAGIC_NUM = 1103806595072
+
+# Dimensions table entry
+class EftDimensionsTableEntry:
+    def __init__(self, code, actual_size):
+        self.code = code
+        self.actual_size = actual_size
+
+# Dimensions table
+image_size_table = [
+    EftDimensionsTableEntry(0x1, 512),
+    EftDimensionsTableEntry(0x2, 1024),
+    EftDimensionsTableEntry(0x3, 1536),
+    EftDimensionsTableEntry(0x4, 2048),
+    EftDimensionsTableEntry(0x5, 2560),
+    EftDimensionsTableEntry(0x6, 3072),
+    EftDimensionsTableEntry(0x7, 3584),
+    EftDimensionsTableEntry(0x8, 4096),
+    EftDimensionsTableEntry(0x9, 4608),
+    EftDimensionsTableEntry(0xA, 5120),
+    EftDimensionsTableEntry(0xB, 5632),
+    EftDimensionsTableEntry(0xC, 6144),
+    EftDimensionsTableEntry(0xD, 6656),
+    EftDimensionsTableEntry(0xE, 7168),
+    EftDimensionsTableEntry(0xF, 7680),
+    EftDimensionsTableEntry(0x10, 8192)
+]
+
+# EFT file structure
+class EftFile:
+    def __init__(self):
+        self.magic = 0
+        self.height = 0
+        self.width = 0
+        self.garbage = None
+        self.data = None
+
+# Color structure
+class Color:
+    def __init__(self, r=0, g=0, b=0, a=255):
+        self.r = r
+        self.g = g
+        self.b = b
+        self.a = a
+
+# Writes a single RGBA block from an EFT's tilemap into the RGBA buffer
+def write_eft_tiles(input, tileindexes, tilecount, width, height, use_bgra, swap_wh):
+    output = [(0, 0, 0, 0) for _ in range(width * height)]
+
+    blocknum = 0
+    height_stride = width if swap_wh else height
+    width_stride = height if swap_wh else width
+
+    for y in range(height_stride // 512):
+        for x in range(width_stride // 512):
+            for y_512 in range(512):
+                for x_512 in range(512):
+                    x_offset_512 = (x_512 + 8) & 511
+                    y_offset_512 = (y_512 + 4) & 511 if x_512 > 503 else y_512
+
+                    tile_address = blocknum  # Experimental tile data load (unused, some EFTs have strange tile data)
+
+                    if use_bgra:
+                        output[(y_512 + y * 512) * width_stride + x * 512 + x_512] = (
+                            input[tile_address][(y_offset_512 * 512) + x_offset_512].b,  # r
+                            input[tile_address][(y_offset_512 * 512) + x_offset_512].g,  # g
+                            input[tile_address][(y_offset_512 * 512) + x_offset_512].r,  # b
+                            input[tile_address][(y_offset_512 * 512) + x_offset_512].a,  # a
+                        )
+                    else:
+                        output[(y_512 + y * 512) * width_stride + x * 512 + x_512] = (
+                            input[tile_address][(y_offset_512 * 512) + x_offset_512].r,  # r
+                            input[tile_address][(y_offset_512 * 512) + x_offset_512].g,  # g
+                            input[tile_address][(y_offset_512 * 512) + x_offset_512].b,  # b
+                            input[tile_address][(y_offset_512 * 512) + x_offset_512].a,  # a
+                        )
+
+            blocknum += 1
+
+    return output
+
+# Converts an EFT tile's S3TC texture data to RGBA format
+def eft2rgba(input, tileindex, use_bgra):
+    color0 = 0  # color 0
+    color1 = 0  # color 1
+    codes = 0  # code stream to decode 4x4 block
+
+    rgba_buf = [(0, 0, 0, 0) for _ in range(512 * 512)]
+
+    height_in_blocks = 512 // 4
+    width_in_blocks = 512 // 4
+
+    for y in range(height_in_blocks):
+        for x in range(width_in_blocks):
+            # First, copy the needed values from the input
+            color0 = struct.unpack("<H", input[(131072 * tileindex) + (y * 8 * width_in_blocks) + (x * 8) : (131072 * tileindex) + (y * 8 * width_in_blocks) + (x * 8) + 2])[0]
+            color1 = struct.unpack("<H", input[(131072 * tileindex) + (y * 8 * width_in_blocks) + (x * 8) + 2 : (131072 * tileindex) + (y * 8 * width_in_blocks) + (x * 8) + 4])[0]
+
+            codes = struct.unpack("<I", input[(131072 * tileindex) + (y * 8 * width_in_blocks) + (x * 8) + 4 : (131072 * tileindex) + (y * 8 * width_in_blocks) + (x * 8) + 8])[0]
+
+            reversed_codes = int.from_bytes(codes.to_bytes(4, "little"), "little")
+
+            color0_rgb = [
+                ((color0 >> 11) & 0x1F) * 527 + 23 >> 6,
+                ((color0 >> 5) & 0x3F) * 259 + 33 >> 6,
+                (color0 & 0x1F) * 527 + 23 >> 6,
+            ]
+
+            color1_rgb = [
+                ((color1 >> 11) & 0x1F) * 527 + 23 >> 6,
+                ((color1 >> 5) & 0x3F) * 259 + 33 >> 6,
+                (color1 & 0x1F) * 527 + 23 >> 6,
+            ]
+
+            for yb in range(4):
+                for xb in range(4):
+                    bitshift_amount_x = xb * 2
+                    bitshift_amount_y = yb * 4 * 2
+
+                    if color0 > color1:
+                        code = (reversed_codes >> (bitshift_amount_x + bitshift_amount_y)) & 0x3
+                        if code == 0x0:
+                            rgb_row = color0_rgb
+                        elif code == 0x1:
+                            rgb_row = color1_rgb
+                        elif code == 0x2:
+                            rgb_row = [
+                                (2 * color0_rgb[0] + color1_rgb[0]) // 3,
+                                (2 * color0_rgb[1] + color1_rgb[1]) // 3,
+                                (2 * color0_rgb[2] + color1_rgb[2]) // 3,
+                            ]
+                        elif code == 0x3:
+                            rgb_row = [
+                                (color0_rgb[0] + 2 * color1_rgb[0]) // 3,
+                                (color0_rgb[1] + 2 * color1_rgb[1]) // 3,
+                                (color0_rgb[2] + 2 * color1_rgb[2]) // 3,
+                            ]
+                    elif color0 <= color1:
+                        code = (reversed_codes >> (bitshift_amount_x + bitshift_amount_y)) & 0x3
+                        if code == 0x0:
+                            rgb_row = color0_rgb
+                        elif code == 0x1:
+                            rgb_row = color1_rgb
+                        elif code == 0x2:
+                            rgb_row = [
+                                (color0_rgb[0] + color1_rgb[0]) // 2,
+                                (color0_rgb[1] + color1_rgb[1]) // 2,
+                                (color0_rgb[2] + color1_rgb[2]) // 2,
+                            ]
+                        elif code == 0x3:
+                            rgb_row = [0, 0, 0]
+
+                    if use_bgra:
+                        rgba_buf[(yb + y * 4) * 512 + (4 * x) + xb] = tuple(rgb_row + [255])
+                    else:
+                        rgba_buf[(yb + y * 4) * 512 + (4 * x) + xb] = tuple(rgb_row + [255])
+
+    return rgba_buf
+
+def get_garbage_data(data, header_offset, tile_count, tile_entry_size):
+    garbage_start = header_offset + tile_count * tile_entry_size
+    garbage_data = data[garbage_start:]
+    return garbage_data
+
+HEADER_SIZE = 1024
+TILE_ENTRY_SIZE = 131072
+
+def actual_size(entry):
+    return entry.actual_size
+
+# Parses an EFT file and returns the RGBA buffer
+def parse_eft_file(filename, use_bgra=False, swap_wh=False):
+    with open(filename, "rb") as f:
+        eft_data = f.read()
+
+    eft_file = EftFile()
+
+    eft_file.magic = struct.unpack("<Q", eft_data[:8])[0]
+    dimensions_table_code = struct.unpack("<H", eft_data[8:10])[0]
+    eft_file.height = next(actual_size(entry) for entry in image_size_table if entry.code == dimensions_table_code)
+    eft_file.width = eft_file.height  # Set width equal to height for square tiles
+    eft_file.garbage = eft_data[12:16]
+    eft_file.data = eft_data[16:]
+
+    if eft_file.magic != EFT_MAGIC_NUM:
+        raise ValueError("Invalid EFT file")
+
+    tile_count = len(eft_file.data) // TILE_ENTRY_SIZE
+
+    header_offset = HEADER_SIZE
+    garbage_data = get_garbage_data(eft_file.data, header_offset, tile_count, TILE_ENTRY_SIZE)
+
+    with ThreadPoolExecutor() as executor:
+        rgba_buffer = list(executor.map(lambda i: eft2rgba(eft_file.data, i, use_bgra), range(tile_count)))
+
+    output_width = eft_file.width
+    output_height = eft_file.height
+
+    print(f"EFT file width: {eft_file.width}")
+    print(f"EFT file height: {eft_file.height}")
+    print(f"Tile count: {tile_count}")
+    print(f"Output width: {output_width}")
+    print(f"Output height: {output_height}")
+
+    return rgba_buffer, output_width, output_height
+
+def bilinear_interpolate(x, y, pixels, image):
+    x1, y1 = int(x), int(y)
+    x2, y2 = x1 + 1, y1 + 1
+
+    if x2 >= image.width:
+        x2 = x1
+    if y2 >= image.height:
+        y2 = y1
+
+    r1 = [(x2 - x) * pixel1 + (x - x1) * pixel2 for pixel1, pixel2 in zip(pixels[x1, y1], pixels[x2, y1])]
+    r2 = [(x2 - x) * pixel1 + (x - x1) * pixel2 for pixel1, pixel2 in zip(pixels[x1, y2], pixels[x2, y2])]
+
+    return tuple(int((y2 - y) * r1_comp + (y - y1) * r2_comp) for r1_comp, r2_comp in zip(r1, r2))
+
+def convert_eft_file(filename, export_format):
+    rgba_buffer, output_width, output_height = parse_eft_file(filename)
+
+    image = Image.new('RGBA', (output_width, output_height))
+    pixels = image.load()
+    for tile_y in range(output_height // 512):
+        for tile_x in range(output_width // 512):
+            for y in range(512):
+                for x in range(512):
+                    # Color from buffer
+                    color = rgba_buffer[(tile_y * (output_width // 512) + tile_x)][(y * 512) + x]
+                    
+                    # Calculate pixel coordinates in the image
+                    image_x = tile_x * 512 + x
+                    image_y = tile_y * 512 + y
+                    
+                    # If the pixel is in a seam, use bilinear interpolation
+                    if y < 4 and tile_y > 0:
+                        color = bilinear_interpolate(image_x, image_y, pixels, image)
+                    
+                    # Set the color of the pixel in the image
+                    pixels[image_x, image_y] = (color.r, color.g, color.b, color.a) if isinstance(color, Color) else tuple(color)
+
+    output_filename = f"{os.path.splitext(filename)[0]}.converted.{export_format.lower()}"
+
+    if export_format == "JPG":
+        image = image.convert("RGB")  # Convert RGBA to RGB for JPEG format
+
+    image.save(output_filename)
+    print(f"Conversion complete. Image saved as {output_filename}")
+
+
+def browse_files():
+    filename = filedialog.askopenfilename(initialdir=os.getcwd(), title="Select an EFT file")
+    if filename:
+        progress_bar.start()
+        convert_button.config(state=tk.DISABLED)
+        export_format = export_format_var.get()
+        convert_eft_file(filename, export_format)
+        progress_bar.stop()
+        convert_button.config(state=tk.NORMAL)
+
+root = tk.Tk()
+root.title("EFT File Converter")
+
+# GUI elements
+file_label = tk.Label(root, text="Choose an EFT file:")
+file_label.pack()
+
+convert_button = tk.Button(root, text="Convert", command=browse_files)
+convert_button.pack()
+
+export_format_var = tk.StringVar(value="PNG")
+
+export_format_frame = tk.Frame(root)
+export_format_frame.pack()
+
+tga_checkbox = tk.Checkbutton(export_format_frame, text="TGA", variable=export_format_var, onvalue="TGA")
+tga_checkbox.pack(side=tk.LEFT)
+
+png_checkbox = tk.Checkbutton(export_format_frame, text="PNG", variable=export_format_var, onvalue="PNG")
+png_checkbox.pack(side=tk.LEFT)
+
+jpg_checkbox = tk.Checkbutton(export_format_frame, text="JPG", variable=export_format_var, onvalue="JPG")
+jpg_checkbox.pack(side=tk.LEFT)
+
+progress_bar = tk.ttk.Progressbar(root, mode="indeterminate")
+progress_bar.pack()
+
+output_image_label = tk.Label(root)
+output_image_label.pack()
+
+def update_output_image(image_path):
+    image = Image.open(image_path)
+    image.thumbnail((200, 200))
+    photo = ImageTk.PhotoImage(image)
+    output_image_label.configure(image=photo)
+    output_image_label.image = photo
+
+root.mainloop()
