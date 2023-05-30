@@ -1,5 +1,5 @@
 # LibEFT Python 3.8.5 implementation
-# May 28, 2023
+# May 30, 2023
 # Written by @annabelsandford
 # Based on the C implementation by @FuzzyQuills
 # https://github.com/FuzzyQuills/libeft
@@ -9,6 +9,9 @@
 import importlib.util
 import subprocess
 import urllib.request
+import time
+from concurrent.futures import ProcessPoolExecutor
+from concurrent.futures import ThreadPoolExecutor
 
 # Check if PIL is installed
 spec = importlib.util.find_spec("PIL")
@@ -28,6 +31,9 @@ if spec is None:
 # Import PIL
 from PIL import Image
 import struct
+
+# set time
+start_time = time.time()
 
 # EFT magic number
 EFT_MAGIC_NUM = 1103806595072
@@ -201,6 +207,9 @@ def get_garbage_data(data, header_offset, tile_count, tile_entry_size):
 HEADER_SIZE = 1024
 TILE_ENTRY_SIZE = 131072
 
+def actual_size(entry):
+    return entry.actual_size
+
 # Parses an EFT file and returns the RGBA buffer
 def parse_eft_file(filename, use_bgra=False, swap_wh=False):
     with open(filename, "rb") as f:
@@ -210,7 +219,7 @@ def parse_eft_file(filename, use_bgra=False, swap_wh=False):
 
     eft_file.magic = struct.unpack("<Q", eft_data[:8])[0]
     dimensions_table_code = struct.unpack("<H", eft_data[8:10])[0]
-    eft_file.height = next(entry.actual_size for entry in image_size_table if entry.code == dimensions_table_code)
+    eft_file.height = next(actual_size(entry) for entry in image_size_table if entry.code == dimensions_table_code)
     eft_file.width = eft_file.height  # Set width equal to height for square tiles
     eft_file.garbage = eft_data[12:16]
     eft_file.data = eft_data[16:]
@@ -223,9 +232,8 @@ def parse_eft_file(filename, use_bgra=False, swap_wh=False):
     header_offset = HEADER_SIZE
     garbage_data = get_garbage_data(eft_file.data, header_offset, tile_count, TILE_ENTRY_SIZE)
 
-    rgba_buffer = [
-        eft2rgba(eft_file.data, i, use_bgra) for i in range(tile_count)
-    ]
+    with ThreadPoolExecutor() as executor:
+        rgba_buffer = list(executor.map(lambda i: eft2rgba(eft_file.data, i, use_bgra), range(tile_count)))
 
     output_width = eft_file.width #* 512
     output_height = eft_file.height #* 512
@@ -237,8 +245,9 @@ def parse_eft_file(filename, use_bgra=False, swap_wh=False):
     print(f"Output height: {output_height}")
 
     return rgba_buffer, output_width, output_height
+    
 
-rgba_buffer, output_width, output_height = parse_eft_file("example.eft")
+rgba_buffer, output_width, output_height = parse_eft_file("example_smallestmap.eft")
 
 image = Image.new('RGBA', (output_width, output_height))
 pixels = image.load()
@@ -251,4 +260,7 @@ for tile_y in range(output_height // 512):
                 image_y = tile_y * 512 + y
                 pixels[image_x, image_y] = (color.r, color.g, color.b, color.a)
 
-image.save("output.tga")
+image.save("output_slow.png")
+
+# Print time
+print("--- %s seconds ---" % (time.time() - start_time))
